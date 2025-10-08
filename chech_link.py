@@ -5,9 +5,11 @@ import pandas as pd
 import os
 from tqdm import tqdm
 import re
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- FUNCTIONS ---
+
+MAX_THREADS = 20    
 
 def run_graphql_query(query, variables, github_token):
     headers = {
@@ -64,11 +66,18 @@ def extract_visible_http_links(markdown_text):
     if not markdown_text:
         return []
     # Simple regex for http/https URLs
-    link_pattern = re.compile(r'(https?://[^\s)]+)')
+    link_pattern = re.compile(r'https?://[^\s<>()\[\]`]+')
     return link_pattern.findall(markdown_text)
 
 
 def get_media_type(url):
+    # --- sanitize malformed URLs first ---
+    url = url.strip().strip('`[]()<>')
+
+    # ignore localhost or malformed URLs
+    if "localhost" in url or "127.0.0.1" in url or not re.match(r"^https?://", url):
+        return "invalid"
+
     try:
         response = requests.head(url, allow_redirects=True, timeout=5)
         content_type = response.headers.get("Content-Type", "")
@@ -83,41 +92,64 @@ def get_media_type(url):
                 return "text"
             else:
                 return content_type.split("/")[0]
+    except requests.exceptions.InvalidURL:
+        return "invalid"
     except Exception:
-        # If HEAD request fails, fall back to guessing from extension
-        ext = urlparse(url).path.split(".")[-1]
-        guessed_type = mimetypes.guess_type(f"file.{ext}")[0]
-        if guessed_type:
-            return guessed_type.split("/")[0]
+        # fallback to extension-based guess
+        try:
+            ext = urlparse(url).path.split(".")[-1]
+            guessed_type = mimetypes.guess_type(f"file.{ext}")[0]
+            if guessed_type:
+                return guessed_type.split("/")[0]
+        except Exception:
+            return "unknown"
+
         return "unknown"
 
-    # Fallback if no Content-Type and no extension-based guess
     return "unknown"
-
 
 def extract_pr_links(repo, github_token):
     repo_name = repo.replace("/", "_")
     csv_file = f"{repo_name}.csv"
 
-    # Initialize CSV with headers if not exists
     if not os.path.exists(csv_file):
         pd.DataFrame(columns=["repo", "pr_link", "pr_title", "link", "media_type", "isGithub"]).to_csv(
             csv_file, index=False
         )
 
     total_processed = 0
+    all_results = []
 
-    for pr_page in get_pull_requests_paginated(repo, github_token):
+    print(f"🔍 Fetching PRs for {repo}...")
+
+    for pr_page in tqdm(get_pull_requests_paginated(repo, github_token), desc="Fetching PR pages"):
         page_results = []
+        links_to_check = []
+
         for pr in pr_page:
             pr_number = pr["number"]
             pr_title = pr["title"]
-            pr_body = pr["body"] or ""  # in case body is None
+            pr_body = pr["body"] or ""
             pr_link = f"https://github.com/{repo}/pull/{pr_number}"
-            links = extract_visible_http_links(pr_body)
 
+            links = extract_visible_http_links(pr_body)
             for link in links:
-                media_type = get_media_type(link)
+                links_to_check.append((pr_link, pr_title, link))
+
+        # Parallel processing of links
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            future_to_link = {
+                executor.submit(get_media_type, link): (pr_link, pr_title, link)
+                for (pr_link, pr_title, link) in links_to_check
+            }
+
+            for future in tqdm(as_completed(future_to_link), total=len(future_to_link), desc="Checking links"):
+                pr_link, pr_title, link = future_to_link[future]
+                try:
+                    media_type = future.result()
+                except Exception:
+                    media_type = "unknown"
+
                 is_github = link.startswith("https://github.com")
                 page_results.append({
                     "repo": repo,
@@ -130,13 +162,12 @@ def extract_pr_links(repo, github_token):
 
         if page_results:
             df = pd.DataFrame(page_results)
-            df.to_csv(csv_file, mode="a", header=False, index=False)  # append only
+            df.to_csv(csv_file, mode="a", header=False, index=False)
             total_processed += len(page_results)
-            print(f"Saved {len(page_results)} links (total so far: {total_processed})")
+            tqdm.write(f"💾 Saved {len(page_results)} links (total so far: {total_processed})")
 
     print(f"✅ Finished! Total links saved for {repo}: {total_processed} → {csv_file}")
-
-
+    
 # --- MAIN ---
 if __name__ == "__main__":
     repo = input("Enter the repo name (e.g. owner/repo): ").strip()
